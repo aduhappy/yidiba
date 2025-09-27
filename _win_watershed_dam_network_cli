@@ -1,0 +1,165 @@
+
+# -*- coding: utf-8 -*-
+"""
+构建坝系网络（累计口径：截至到 t 年（含）），年份由命令行手动输入
+用法示例：
+  python _win_watershed_dam_network_cli.py --years 1990 2000 2010 2020 2024
+  python _win_watershed_dam_network_cli.py -y 2005,2010,2015
+可选：
+  --input "F:\...\dams_clean.gpkg|dams_points"
+  --out-gpkg "F:\...\dam_network.gpkg"
+  --out-csv  "F:\...\dam_edges_all.csv"
+  --start-field 建成年
+  --prefix-len 3
+"""
+
+import argparse
+from typing import List, Optional, Tuple, Dict
+from pathlib import Path
+
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry import Point, LineString
+
+# ---------------- 默认参数（可通过命令行覆盖） ----------------
+DEFAULT_INPUT = r"F:\OneDrive - 8f7hnp\work\2025年\9月\孙彭成老师\To Lintao\python\淤地坝\陕西延河流域淤地坝\dams_clean.gpkg|dams_points"
+DEFAULT_OUT_GPKG = r"F:\OneDrive - 8f7hnp\work\2025年\9月\孙彭成老师\To Lintao\python\淤地坝\陕西延河流域淤地坝\dam_network.gpkg"
+DEFAULT_OUT_CSV  = r"F:\OneDrive - 8f7hnp\work\2025年\9月\孙彭成老师\To Lintao\python\淤地坝\陕西延河流域淤地坝\dam_edges_all.csv"
+
+CODE_FIELD = "code"          # 预处理后标准化的编码列
+START_FIELD_DEFAULT = "建成年"
+END_FIELD_DEFAULT   = None
+SUBBASIN_PREFIX_LEN_DEFAULT = 3
+
+# ---------------- 工具函数 ----------------
+def normalize_code(v) -> str:
+    if pd.isna(v): return ""
+    return str(v).strip()
+
+def code_level(code: str, sub_prefix_len: int) -> int:
+    if len(code) < sub_prefix_len: return -1
+    tail = len(code) - sub_prefix_len
+    if tail % 2 != 0: return -1
+    return tail // 2
+
+def parent_code(code: str, sub_prefix_len: int):
+    lvl = code_level(code, sub_prefix_len)
+    if lvl <= 0: return None
+    return code[:-2]
+
+def subbasin_of(code: str, sub_prefix_len: int) -> str:
+    return code[:sub_prefix_len]
+
+def read_any(path_or_layer: str) -> gpd.GeoDataFrame:
+    if "|" in path_or_layer:
+        path, layer = path_or_layer.split("|", 1)
+        return gpd.read_file(path, layer=layer)
+    return gpd.read_file(path_or_layer)
+
+def ensure_point_geometry(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    if gdf.geometry.geom_type.isin(["Point","MultiPoint"]).all():
+        return gdf.copy()
+    out = gdf.copy()
+    out["geometry"] = gdf.geometry.centroid
+    return out
+
+def build_nodes_edges(gdf, code_field, sub_prefix_len, start_field=None, end_field=None):
+    g = ensure_point_geometry(gdf)
+    g["code"] = g[code_field].apply(normalize_code)
+    g = g[g["code"] != ""].copy()
+    g["level"]    = g["code"].apply(lambda c: code_level(c, sub_prefix_len))
+    g["subbasin"] = g["code"].apply(lambda c: subbasin_of(c, sub_prefix_len))
+    g["parent"]   = g["code"].apply(lambda c: parent_code(c, sub_prefix_len))
+    geom_map: Dict[str, Point] = dict(zip(g["code"], g.geometry))
+
+    edges = []
+    for r in g.itertuples(index=False):
+        if r.parent is None: continue
+        if r.parent in geom_map:
+            edges.append({"child": r.code, "parent": r.parent, "level": r.level, "subbasin": r.subbasin,
+                          "geometry": LineString([r.geometry, geom_map[r.parent]])})
+        else:
+            edges.append({"child": r.code, "parent": r.parent, "level": r.level, "subbasin": r.subbasin, "geometry": None})
+
+    edges_gdf = gpd.GeoDataFrame(edges, geometry="geometry", crs=g.crs)
+    keep = ["code","level","subbasin","parent","geometry"]
+    if start_field and start_field in g.columns: keep.insert(-1, start_field)
+    if end_field and end_field in g.columns: keep.insert(-1, end_field)
+    nodes = g[keep].copy()
+    return nodes, edges_gdf, edges_gdf.drop(columns=["geometry"]).copy()
+
+def _coerce_year_series(s: pd.Series) -> pd.Series:
+    if s is None or s.empty: return s
+    if pd.api.types.is_numeric_dtype(s): return s.astype("Float64")
+    out = []
+    for v in s:
+        if pd.isna(v):
+            out.append(pd.NA); continue
+        digits = "".join(ch for ch in str(v) if ch.isdigit())
+        if len(digits) >= 4:
+            y = int(digits[:4])
+            out.append(y if 1800 <= y <= 2100 else pd.NA)
+        else:
+            out.append(pd.NA)
+    return pd.Series(out, index=s.index, dtype="Float64")
+
+def filter_by_time_cumulative(nodes, edges, t, start_field: Optional[str]):
+    """累计口径：仅保留 start_field <= t 的节点；边需两端均满足（忽略退役）。"""
+    n = nodes.copy()
+    if start_field and start_field in n.columns:
+        n[start_field] = _coerce_year_series(n[start_field])
+        n = n[n[start_field].notna() & (n[start_field] <= t)]
+    active = set(n["code"])
+    e = edges[edges["child"].isin(active) & edges["parent"].isin(active)].copy()
+    return n, e
+
+def export_all(nodes_all, edges_all, out_gpkg, out_csv_all, snapshots: List[int], start_field: Optional[str]):
+    outp = Path(out_gpkg)
+    if outp.exists(): outp.unlink()
+    nodes_all.to_file(out_gpkg, layer="nodes_all", driver="GPKG")
+    edges_all.to_file(out_gpkg, layer="edges_all", driver="GPKG")
+    edges_all.drop(columns=["geometry"]).to_csv(out_csv_all, index=False, encoding="utf-8-sig")
+    for t in snapshots:
+        n_t, e_t = filter_by_time_cumulative(nodes_all, edges_all, t, start_field)
+        n_t.to_file(out_gpkg, layer=f"nodes_t_{t}", driver="GPKG")
+        e_t.to_file(out_gpkg, layer=f"edges_t_{t}", driver="GPKG")
+        e_t.drop(columns=["geometry"]).to_csv(outp.with_name(f"dam_edges_t_{t}.csv"), index=False, encoding="utf-8-sig")
+
+def parse_years(year_args: List[str]) -> List[int]:
+    years: List[int] = []
+    for token in year_args:
+        # 支持 "1990,2000,2010" 或 "1990"
+        for part in str(token).replace("，", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            y = int(part)
+            years.append(y)
+    # 去重 + 排序
+    years = sorted(set(years))
+    return years
+
+def main():
+    ap = argparse.ArgumentParser(description="坝系网络：手动输入年份，生成“截至到 t 年（含）”快照")
+    ap.add_argument("-y","--years", nargs="+", required=True, help="年份列表，如：1990 2000 2010 或 1990,2000,2010")
+    ap.add_argument("--input", default=DEFAULT_INPUT, help="输入（建议清洗产物）：path|layer")
+    ap.add_argument("--out-gpkg", default=DEFAULT_OUT_GPKG, help="输出 GeoPackage")
+    ap.add_argument("--out-csv",  default=DEFAULT_OUT_CSV, help="输出 CSV 边表")
+    ap.add_argument("--start-field", default=START_FIELD_DEFAULT, help="开始时间字段名（默认：建成年）")
+    ap.add_argument("--end-field", default=END_FIELD_DEFAULT, help="结束时间字段名（默认无，不做过滤）")
+    ap.add_argument("--prefix-len", type=int, default=SUBBASIN_PREFIX_LEN_DEFAULT, help="子流域前缀长度（默认3）")
+
+    args = ap.parse_args()
+    years = parse_years(args.years)
+    if not years:
+        raise SystemExit("未解析到有效年份，请检查 --years 输入")
+
+    gdf = read_any(args.input)
+    nodes_all, edges_all, _ = build_nodes_edges(gdf, CODE_FIELD, args.prefix_len, args.start_field, args.end_field)
+    export_all(nodes_all, edges_all, args.out_gpkg, args.out_csv, years, args.start_field)
+
+    print("写入：", args.out_gpkg, "和", args.out_csv)
+    print("累计快照（≤年）：", years)
+
+if __name__ == "__main__":
+    main()
